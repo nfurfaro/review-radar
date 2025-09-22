@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::fs;
+use review_radar::{
+    parse_org_modification, Config, GhPullRequest, GhRepo, OrgModification, PullRequest, User,
+};
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Parser, Debug)]
@@ -68,57 +68,6 @@ enum Commands {
     },
     #[command(about = "Show current configuration")]
     Config,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Config {
-    orgs: Vec<String>,
-    username: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo_pattern: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PullRequest {
-    number: u32,
-    title: String,
-    html_url: String,
-    user: User,
-}
-
-#[derive(Debug, Deserialize)]
-struct User {
-    login: String,
-}
-
-impl Config {
-    fn config_path() -> Result<PathBuf> {
-        let config_dir =
-            dirs::config_dir().ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
-        Ok(config_dir.join("review-radar").join("config.toml"))
-    }
-
-    fn load() -> Result<Self> {
-        let path = Self::config_path()?;
-        if !path.exists() {
-            return Err(anyhow::anyhow!(
-                "Configuration not found. Run 'review-radar init <orgs> <username>' to set up."
-            ));
-        }
-        let content = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
-    }
-
-    fn save(&self) -> Result<()> {
-        let path = Self::config_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)?;
-        fs::write(path, content)?;
-        Ok(())
-    }
 }
 
 struct GitHubClient;
@@ -283,7 +232,7 @@ impl GitHubClient {
                             user: User {
                                 login: pr.author.login,
                             },
-                            });
+                        });
                     }
                 }
             }
@@ -293,28 +242,6 @@ impl GitHubClient {
 
         Ok(all_prs)
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct GhRepo {
-    name: String,
-    #[serde(skip)]
-    org: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhPullRequest {
-    number: u32,
-    title: String,
-    url: String,
-    author: GhUser,
-    #[serde(rename = "reviewRequests")]
-    review_requests: Vec<GhUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhUser {
-    login: String,
 }
 
 fn main() -> Result<()> {
@@ -353,31 +280,28 @@ fn main() -> Result<()> {
             let mut updated = false;
 
             if let Some(org_str) = orgs {
-                if let Some(stripped) = org_str.strip_prefix('+') {
-                    // Add organization
-                    let new_org = stripped.trim().to_string();
-                    if !config.orgs.contains(&new_org) {
-                        config.orgs.push(new_org.clone());
-                        println!("➕ Added organization: {}", new_org);
-                        updated = true;
-                    } else {
-                        println!("ℹ️  Organization '{}' already exists", new_org);
+                match parse_org_modification(&org_str) {
+                    OrgModification::Add(new_org) => {
+                        if config.add_org(new_org.clone()) {
+                            println!("➕ Added organization: {}", new_org);
+                            updated = true;
+                        } else {
+                            println!("ℹ️  Organization '{}' already exists", new_org);
+                        }
                     }
-                } else if let Some(stripped) = org_str.strip_prefix('-') {
-                    // Remove organization
-                    let remove_org = stripped.trim().to_string();
-                    if let Some(pos) = config.orgs.iter().position(|x| x == &remove_org) {
-                        config.orgs.remove(pos);
-                        println!("➖ Removed organization: {}", remove_org);
-                        updated = true;
-                    } else {
-                        println!("ℹ️  Organization '{}' not found", remove_org);
+                    OrgModification::Remove(remove_org) => {
+                        if config.remove_org(&remove_org) {
+                            println!("➖ Removed organization: {}", remove_org);
+                            updated = true;
+                        } else {
+                            println!("ℹ️  Organization '{}' not found", remove_org);
+                        }
                     }
-                } else {
-                    // Replace all organizations
-                    config.orgs = org_str.split(',').map(|s| s.trim().to_string()).collect();
-                    println!("✅ Updated organizations");
-                    updated = true;
+                    OrgModification::Replace(new_orgs) => {
+                        config.set_orgs(new_orgs);
+                        println!("✅ Updated organizations");
+                        updated = true;
+                    }
                 }
             }
             if let Some(new_username) = username {
@@ -385,23 +309,20 @@ fn main() -> Result<()> {
                 updated = true;
             }
             if let Some(new_pattern) = repo_pattern {
-                if new_pattern.to_lowercase() == "none" {
-                    config.repo_pattern = None;
-                    println!("🗑️  Cleared repository filter pattern");
-                } else {
-                    // Validate the regex
-                    match Regex::new(&new_pattern) {
-                        Ok(_) => {
-                            config.repo_pattern = Some(new_pattern);
+                match config.set_repo_pattern(Some(new_pattern)) {
+                    Ok(_) => {
+                        if config.repo_pattern.is_none() {
+                            println!("🗑️  Cleared repository filter pattern");
+                        } else {
                             println!("✅ Updated repository filter pattern");
                         }
-                        Err(e) => {
-                            println!("❌ Invalid regex pattern: {}", e);
-                            return Ok(());
-                        }
+                        updated = true;
+                    }
+                    Err(e) => {
+                        println!("❌ {}", e);
+                        return Ok(());
                     }
                 }
-                updated = true;
             }
 
             if updated {
